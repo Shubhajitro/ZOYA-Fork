@@ -106,7 +106,7 @@ assert.ok(controllerSource.includes("emergency_disengage_confirmed=")&&controlle
   assert.ok(controllerSource.includes("mace_evasion_confirmed=")&&controllerSource.includes("return evasionConfirmed;"),
     "mace evasion must confirm observed displacement instead of succeeding from issued movement inputs alone");
 
-assert.ok(controllerSource.includes("shield_raised_observed=")&&controllerSource.includes("isEntityBlockingWithShield(bot.entity)")&&controllerSource.includes("projectile_block_confirmed=false"),
+assert.ok(controllerSource.includes("shield_raised_observed=")&&controllerSource.includes("isEntityBlockingWithShield(bot.entity)")&&controllerSource.includes('projectile_block_confirmed="+(blockConfirmed?"true":"false")'),
     "shield execution must observe an active shield raise and must not mislabel the pose as a confirmed projectile block");
 
 assert.ok(controllerSource.includes('" shieldReady="+Boolean(ctx.shieldReady)+" meleeBlockReady="+Boolean(ctx.meleeBlockReady)+" projectileThreat="+Boolean(ctx.projectileThreat)'),
@@ -1006,7 +1006,7 @@ assert.ok(controllerSource.includes("retreating:speed(t)>.18&&!enemyClosing"),
   "retreat adaptation must distinguish movement away from ZOYA from generic target movement");
 
 
-assert.ok(controllerSource.includes('const PVP_EXPERT_BUILD_MARKER="2026-10-11-pearl-catch-hotbar-same-line-v3"') && controllerSource.includes('controller_build="+PVP_EXPERT_BUILD_MARKER'), "runtime logs must identify the exact PvP controller build so stale executables are detectable");
+assert.ok(controllerSource.includes('const PVP_EXPERT_BUILD_MARKER="2026-11-01-mc-1.21.11-tick-mechanics-v4"') && controllerSource.includes('controller_build="+PVP_EXPERT_BUILD_MARKER'), "runtime logs must identify the exact PvP controller build so stale executables are detectable");
 assert.ok(controllerSource.includes('bow:has(bot,"bow"),crossbow:has(bot,"crossbow"),crystal:has(bot,"crystal"),obsidian:has(bot,"obsidian")'),
   "brain capability flags must expose bow/crossbow/crystal items consumed by has(ctx,key), so ranged adaptation and mace crystal D-tap are reachable");
 {
@@ -1083,7 +1083,7 @@ console.log("Sprint-free critical-hit timing tests passed.");
     "shielding must hold for the configured impact window after the block animation begins");
   assert.ok(controllerSource.includes('case "shield": ok=await shield(t,ctx.projectileThreat?550:320);break;'),
     "projectile defense must use a longer shield hold than a brief melee block");
-  assert.ok(controllerSource.includes("shield_raised_observed=") && controllerSource.includes("projectile_block_confirmed=false"),
+  assert.ok(controllerSource.includes("shield_raised_observed=") && controllerSource.includes('projectile_block_confirmed="+(blockConfirmed?"true":"false")'),
     "shield telemetry must not mistake observing the raised pose for confirming that a projectile was actually blocked");
 }
 console.log("Projectile shield impact-window tests passed.");
@@ -1096,12 +1096,13 @@ console.log("Projectile shield impact-window tests passed.");
   const smashEnd=controllerSource.indexOf("const wind=async t=>",smashStart);
   const smashBody=controllerSource.slice(smashStart,smashEnd);
   assert.ok(smashBody.includes("const smashHitboxDistance=distanceToEntityHitbox(bot.entity,live)") &&
-    smashBody.includes("if(falling&&fallDistance>1.5&&smashHitboxDistance<=3.05)"),
+    smashBody.includes("if(falling&&smashReady&&smashHitboxDistance<=reachCap)") &&
+    smashBody.includes("const smashReady=CM.canMaceSmash({fallDistance,fallFlying:bot.entity?.elytraFlying===true})"),
     "mace smash must use target hitbox distance during descent instead of an overly restrictive center-distance band");
   const windStart=controllerSource.indexOf("const wind=async t=>");
   const windEnd=controllerSource.indexOf("const dodge=async t=>",windStart);
   const windBody=controllerSource.slice(windStart,windEnd);
-  assert.ok(windBody.includes("if(fallDistance>1.5&&smashHitboxDistance<=3.05)"),
+  assert.ok(windBody.includes("if(CM.canMaceSmash({fallDistance,fallFlying:bot.entity?.elytraFlying===true})&&smashHitboxDistance<=reachCap)"),
     "wind-charge mace combo must call the smash executor when the falling hitbox enters real reach");
 }
 console.log("Falling mace hitbox-window tests passed.");
@@ -1167,10 +1168,11 @@ assert.ok(controllerSource.includes("hp>7&&!enemyMaceHeldClose&&!enemyMaceThreat
 const throwPearlStart=controllerSource.indexOf("const throwPearl=async(t,mode=\"escape\")=>");
 const throwPearlEnd=controllerSource.indexOf("const webEscape=async()=>",throwPearlStart);
 const throwPearlBody=controllerSource.slice(throwPearlStart,throwPearlEnd);
-assert.ok(throwPearlBody.includes("const estimatedFlightTicks=horizontalDistance/1.35") &&
-  throwPearlBody.includes("const dropCompensation=Math.max(0.15,Math.min(3.5,0.03*estimatedFlightTicks*(estimatedFlightTicks+1)/2))") &&
+assert.ok(throwPearlBody.includes("const solution=CM.solveProjectileAim(") &&
+  throwPearlBody.includes("shooterVelocity:bot.entity?.velocity||null") &&
+  !throwPearlBody.includes("const dropCompensation=") &&
   throwPearlBody.includes("await bot.lookAt(aimPoint,true)"),
-  "ordinary pearl throws must compensate for gravity instead of aiming directly at the landing block");
+  "ordinary pearl throws must solve the drag/gravity trajectory (incl. thrower motion) instead of aiming at the landing block");
 assert.ok(throwPearlBody.includes("const teleportDeadline=Date.now()+3500") &&
   throwPearlBody.includes("pearl_throw_aim mode="),
   "pearl throws must expose aim geometry and allow a bounded landing/teleport confirmation window");

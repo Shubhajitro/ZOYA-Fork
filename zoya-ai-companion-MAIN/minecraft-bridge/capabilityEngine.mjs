@@ -1,6 +1,8 @@
 import pathfinderPackage from "mineflayer-pathfinder";
 const { goals } = pathfinderPackage;
 import { CAPABILITY_MODES, assertCapabilityRegistry } from "./capabilityModes.mjs";
+import { getCombatAuthority } from "./combatAuthority.mjs";
+import { critBlockers } from "./combatMechanics.mjs";
 
 export const CAPABILITIES = CAPABILITY_MODES;
 
@@ -1082,8 +1084,56 @@ function targetEntity(ctx,name){const q=required(name,"Target is required.").toL
 async function tridentAttack(ctx,a){const t=targetEntity(ctx,a),i=inventoryItem(ctx.bot,"trident");if(!i)throw new Error("Trident not found.");await navigate(ctx,t.position,3.5,15000,"trident");active(ctx);await ctx.bot.equip(i,"hand");active(ctx);await ctx.bot.attack(t);return true;}
 async function throwTrident(ctx,a){const ms=Math.max(200,number(a)*1000),i=inventoryItem(ctx.bot,"trident");if(!i)throw new Error("Trident not found.");active(ctx);await ctx.bot.equip(i,"hand");active(ctx);ctx.bot.activateItem();try{await wait(ctx,ms)}finally{try{ctx.bot.deactivateItem()}catch{}}return true;}
 async function throwPotionKind(ctx,a,k){const i=inventoryItem(ctx.bot,required(a,"Potion item is required."));if(!i||!i.name.includes(k))throw new Error(k+" not found.");active(ctx);await ctx.bot.equip(i,"hand");active(ctx);ctx.bot.activateItem();await wait(ctx,700);return true;}
-async function knockbackTarget(ctx,a){const t=targetEntity(ctx,a);await navigate(ctx,t.position,3.2,15000,"knockback");active(ctx);ctx.bot.setControlState("sprint",true);try{await wait(ctx,100);active(ctx);await ctx.bot.attack(t)}finally{try{ctx.bot.setControlState("sprint",false)}catch{}}return true;}
-async function criticalAttack(ctx,a){const t=targetEntity(ctx,a);await navigate(ctx,t.position,3.2,15000,"critical");active(ctx);ctx.bot.setControlState("jump",true);await wait(ctx,120);ctx.bot.setControlState("jump",false);await wait(ctx,80);active(ctx);await ctx.bot.attack(t);return true;}
+async function knockbackTarget(ctx,a){
+  const t=targetEntity(ctx,a);await navigate(ctx,t.position,3.2,15000,"knockback");active(ctx);
+  const bot=ctx.bot,authority=getCombatAuthority(bot),lease=authority.acquire("capability_knockback_target");
+  if(!lease)throw new Error("Combat authority busy: "+(authority.holder("attack")||"unknown"));
+  try{
+    // Player.attack applies sprint knockback only when the server-side sprint
+    // flag is set and the swing is strong (charge > 0.9); move forward so the
+    // sprint state is real, then hit.
+    bot.setControlState("forward",true);bot.setControlState("sprint",true);
+    await wait(ctx,150);
+    await bot.lookAt(t.position.offset(0,(t.height||1.8)*0.6,0),true);active(ctx);
+    const sprinting=bot.getControlState?.("sprint")===true;
+    bot.attack(t);
+    ctx.log("knockback_attack executed sprinting="+sprinting+" (knockback is server-confirmed only by target velocity)");
+  }finally{
+    try{bot.setControlState("sprint",false);bot.setControlState("forward",false)}catch{}
+    lease.release();
+  }
+  return true;
+}
+async function criticalAttack(ctx,a){
+  const t=targetEntity(ctx,a);await navigate(ctx,t.position,3.2,15000,"critical");active(ctx);
+  const bot=ctx.bot,authority=getCombatAuthority(bot),lease=authority.acquire("capability_critical_attack");
+  if(!lease)throw new Error("Combat authority busy: "+(authority.holder("attack")||"unknown"));
+  try{
+    // Player.canCriticalAttack: airborne with fallDistance > 0 (descending),
+    // not sprinting, not in water/climbing. Swinging while still rising or
+    // sprinting can never crit, so wait for the real descent first.
+    bot.setControlState("sprint",false);
+    bot.setControlState("jump",true);await wait(ctx,60);bot.setControlState("jump",false);
+    let peak=Number(bot.entity?.position?.y)||0,fall=0;
+    const deadline=Date.now()+800;
+    while(Date.now()<deadline){
+      const y=Number(bot.entity?.position?.y)||0;peak=Math.max(peak,y);fall=peak-y;
+      if(bot.entity?.onGround===false&&Number(bot.entity?.velocity?.y)<0&&fall>=0.1)break;
+      await wait(ctx,20);
+    }
+    // Single-shot capability: attack charge is assumed full (no prior swing is tracked here).
+    const blockers=critBlockers({charge:1,fallDistance:fall,onGround:bot.entity?.onGround===true,
+      inWater:bot.entity?.isInWater===true,sprinting:bot.getControlState?.("sprint")===true});
+    if(blockers.length)throw new Error("Critical hit window not reached: "+blockers.join(","));
+    await bot.lookAt(t.position.offset(0,(t.height||1.8)*0.6,0),true);active(ctx);
+    bot.attack(t);
+    ctx.log("critical_attack executed fall="+fall.toFixed(2)+" (only the server crit animation confirms a crit)");
+  }finally{
+    try{bot.setControlState("jump",false)}catch{}
+    lease.release();
+  }
+  return true;
+}
 async function plantAt(ctx,itemName,p){const i=inventoryItem(ctx.bot,itemName),b=ctx.bot.blockAt(vec(ctx.bot,p));if(!i)throw new Error("Planting item not found.");if(!b||!["farmland","dirt","grass_block","podzol","mycelium","soul_sand"].includes(b.name))throw new Error("Invalid planting block.");await navigate(ctx,b.position,3.5,15000,"planting");active(ctx);await ctx.bot.equip(i,"hand");active(ctx);await ctx.bot.activateBlock(b);await wait(ctx,400);return true;}
 async function plantSeeds(ctx,a){const q=parts(a),i=required(q.shift(),"Seed item is required.");return plantAt(ctx,i,coords(q.join(" ")))}
 async function plantSapling(ctx,a){const q=parts(a),i=required(q.shift(),"Sapling item is required.");return plantAt(ctx,i,coords(q.join(" ")))}
