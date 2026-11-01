@@ -7,6 +7,7 @@ import craftingUtilPackage from "mineflayer-crafting-util";
 import armorManagerPackage from "mineflayer-armor-manager";
 import trackerPackage from "@nxg-org/mineflayer-tracker";
 import { createPvpExpertController } from "./pvpExpertController.mjs";
+import { getCombatAuthority } from "./combatAuthority.mjs";
 import { fileURLToPath } from "node:url";
 
 const { pathfinder, Movements, goals } = pathfinderPackage;
@@ -132,6 +133,10 @@ export function createMinecraftRuntime({ bot, config, stateDir, wakeBrain = () =
     // overlapping inventory/use operation as "invalid operation".
     const activeAction = String(activeTask?.action || "").replace(/^manual:(?:clean:)?/, "");
     if (activeAction === "pvp") return false;
+    // Any combat owner holding the hotbar/item-use lease (PvP controller or a
+    // single-shot combat capability) keeps the hand until it releases it.
+    const combatAuthority = getCombatAuthority(bot);
+    if (combatAuthority.isBlocked("survival_auto_eat", "hotbar") || combatAuthority.isBlocked("survival_auto_eat", "use")) return false;
     if (!survivalNeedsFood() || survivalEating || Date.now() - lastSurvivalEatAt < SURVIVAL_EAT_COOLDOWN_MS) return false;
     if (survivalEatPromise) return survivalEatPromise;
 

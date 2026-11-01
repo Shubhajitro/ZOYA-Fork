@@ -6,8 +6,11 @@
 import { createPvpExpertBrain } from "./pvpExpertBrain.mjs";
 import { Vec3 } from "vec3";
 import { THEO_PVP_DIFFICULTY } from "./pvpDifficulty.mjs";
+import * as CM from "./combatMechanics.mjs";
+import { createCombatTelemetry } from "./combatTelemetry.mjs";
+import { getCombatAuthority } from "./combatAuthority.mjs";
 
-const PVP_EXPERT_BUILD_MARKER="2026-10-11-pearl-catch-hotbar-same-line-v3";
+const PVP_EXPERT_BUILD_MARKER="2026-11-01-mc-1.21.11-tick-mechanics-v4";
 
 const sleep=ms=>new Promise(r=>setTimeout(r,Math.max(0,Number(ms)||0)));
 const num=(v,d=0)=>v==null||v===""?d:Number.isFinite(Number(v))?Number(v):d;
@@ -332,8 +335,72 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     lastAttackConfirmedAt:0,pendingEntityHitUntil:0,lastTargetHurtAt:0,lastSelfTargetHurtAt:0,
     maceLaunchUntil:0,lastMaceSmashAt:0,lastJumpResetAt:0,lastTargetOnGround:null,targetLandedAt:0,maceEvasionCooldownUntil:0,
     lastTargetVelocity:null,lastTargetVelocityAt:0,targetAcceleration:{x:0,y:0,z:0},
-    lastAttackAttemptAt:0,lastAttackConfirmedAt:0,selfPeakY:null,lastCombatDiagAt:0
+    lastAttackAttemptAt:0,lastAttackConfirmedAt:0,selfPeakY:null,lastCombatDiagAt:0,
+    lastCritEffectAt:0,lastSwingAt:0,lastSwingCharge:null
   };
+
+  // Server-tick-aware attack charge: a model of Player.attackStrengthTicker,
+  // reset by every swing and by a main-hand item TYPE change (Player.tick).
+  const clock=CM.createServerTickClock();
+  const chargeTracker=CM.createAttackChargeTracker({clock});
+  const telemetry=createCombatTelemetry({log});
+  const authority=getCombatAuthority(bot,{log});
+  const ATTACK_JITTER_TICKS=Math.max(0,num(combatDifficulty.attackJitterTicks,1));
+  // Vanilla needs fallDistance > 0; keep a small margin for client/server physics drift.
+  const CRIT_MIN_FALL=Math.max(0.0001,num(combatDifficulty.critMinFall,0.1));
+  // Vanilla client reach is 3.0 (eye to target AABB). The server tolerates a
+  // +3.0 buffer, anti-cheat usually does not, so extended reach is opt-in.
+  const reachCap=combatDifficulty.allowExtendedReach===true
+    ?Math.max(CM.VANILLA_ENTITY_REACH,num(combatDifficulty.attackRange,CM.VANILLA_ENTITY_REACH))
+    :CM.VANILLA_ENTITY_REACH;
+  const heldName=()=>lname(bot.heldItem)||"hand";
+  const attackSpeedNow=()=>CM.effectiveAttackSpeed(bot.heldItem,
+    bot.entity?.attributes?.["minecraft:attack_speed"]||bot.entity?.attributes?.["minecraft:generic.attack_speed"]||
+    bot.entity?.attributes?.["generic.attack_speed"]||null);
+  const syncHeldItem=()=>chargeTracker.noteHeldItem(bot.heldItem);
+  const currentCharge=()=>{syncHeldItem();return chargeTracker.charge(attackSpeedNow())};
+  const readyAtFor=(threshold=CM.STRONG_ATTACK_THRESHOLD)=>{
+    syncHeldItem();
+    return chargeTracker.readyAt(attackSpeedNow(),threshold,ATTACK_JITTER_TICKS);
+  };
+  const refreshAttackReady=()=>{state.nextAttackAt=readyAtFor();return state.nextAttackAt};
+  const attackChargeWaitMs=(threshold=CM.STRONG_ATTACK_THRESHOLD)=>{
+    refreshAttackReady();
+    return Math.max(0,readyAtFor(threshold)-Date.now());
+  };
+  const waitForAttackCharge=async(maxWaitMs=260,threshold=CM.STRONG_ATTACK_THRESHOLD)=>{
+    const waitMs=attackChargeWaitMs(threshold);
+    if(waitMs<=0)return true;
+    if(waitMs>maxWaitMs)return false;
+    await sleep(waitMs);
+    return state.active&&taskIsActive();
+  };
+  const selfSprinting=()=>bot.getControlState?.("sprint")===true;
+  const recordSwing=(technique,details={})=>{
+    const at=Date.now();
+    const charge=currentCharge();
+    const sprinting=selfSprinting();
+    chargeTracker.noteSwing(at);
+    state.lastAttackAt=at;state.lastAttackAttemptAt=at;state.lastSwingAt=at;state.lastSwingCharge=charge;
+    state.attackCount++;
+    refreshAttackReady();
+    telemetry.executed(technique,{weapon:heldName(),charge,strong:CM.isStrongAttack(charge),
+      sprintKnockback:CM.canSprintKnockback({charge,sprinting}),tps:clock.tps(),...details});
+    return {at,charge,sprinting};
+  };
+  const critObservedSince=at=>state.lastCritEffectAt>=at;
+  const targetHealthOf=t=>t?.health!=null&&Number.isFinite(Number(t.health))?Number(t.health):null;
+  // Passive observers only (no loop): server world age for TPS, held item for
+  // charge resets, and the server's crit animation (ClientboundAnimatePacket 4).
+  const onWorldTime=()=>clock.observeWorldAge(bot.time?.age);
+  const onHeldItemChanged=()=>syncHeldItem();
+  const onCriticalEffect=entity=>{
+    const target=targetOf(bot,state.targetUsername);
+    if(target&&entity?.id===target.id&&Date.now()-state.lastSwingAt<=700)state.lastCritEffectAt=Date.now();
+  };
+  try{bot.on?.("time",onWorldTime)}catch{}
+  try{bot.on?.("heldItemChanged",onHeldItemChanged)}catch{}
+  try{bot.on?.("entityCriticalEffect",onCriticalEffect)}catch{}
 
   const stop=()=>{
     try{bot.pathfinder?.setGoal?.(null)}catch{}
@@ -655,7 +722,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     log("[PVP-EXPERT] mace_evasion_confirmed="+evasionConfirmed+" moved="+Number(moved||0).toFixed(2)+
       " distance_before="+startDistance.toFixed(2)+" distance_after="+(Number.isFinite(endDistance)?endDistance.toFixed(2):"unknown"));
     if(live?.position&&endDistance<=3.05&&Date.now()>=state.nextAttackAt&&has(bot,"sword")){
-      const confirmed=await attack(live,"sword",3.05);
+      const confirmed=await attack(live,"sword",3.05,{deferOnCharge:false});
       log("[PVP-EXPERT] mace_evasion_counter confirmed="+confirmed);
       return evasionConfirmed||confirmed;
     }
@@ -681,41 +748,59 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     }finally{stop();}
   };
 
-  const attack=async(t,type,maxReach)=>{
-    if(!t||!await equip(type)) return false;
+  const attack=async(t,type,maxReach,{deferOnCharge=true}={})=>{
+    const technique=type==="axe"?"axe_melee":type==="mace"?"mace_melee":type==="spear"?"spear_melee":"sword_melee";
+    telemetry.attempted(technique);
+    if(!t||!await equip(type)){telemetry.rejected(technique,"weapon_unavailable");return false}
     const d=dist(bot.entity,t);
     const hitboxDistance=distanceToEntityHitbox(bot.entity,t);
     // Keep the controller's configured reach cap; the AABB metric improves
     // hit validation but never grants extra reach beyond the chosen cap.
-    if(hitboxDistance>Math.min(Number(maxReach)||3.05,3.05)){
+    const reach=Math.min(Number(maxReach)||reachCap,reachCap);
+    if(hitboxDistance>reach){
       state.failedAction="attack_out_of_range";state.failedActionAt=Date.now();
       log("[PVP-EXPERT] attack_rejected out_of_reach weapon="+type+
-        " feet_distance="+d.toFixed(2)+" eye_hitbox_distance="+hitboxDistance.toFixed(2));
+        " feet_distance="+d.toFixed(2)+" eye_hitbox_distance="+hitboxDistance.toFixed(2)+" reach_cap="+reach.toFixed(2));
+      telemetry.rejected(technique,"out_of_reach",{eyeHitbox:hitboxDistance,reach});
       return false;
+    }
+    // Player.attack scales base damage by 0.2+0.8*charge^2 and only a charge
+    // above 0.9 allows crits and sprint knockback. Wait out a short remaining
+    // charge; for a long one keep moving instead of wasting a weak swing.
+    if(!await waitForAttackCharge(260)){
+      const waitMs=attackChargeWaitMs();
+      telemetry.rejected(technique,"charge_not_ready",{charge:currentCharge(),readyInMs:waitMs,attackSpeed:attackSpeedNow()});
+      if(!deferOnCharge||!state.active||!taskIsActive())return false;
+      await strafe(t,state.strafe,Math.min(220,Math.max(60,waitMs)));state.strafe*=-1;
+      return true;
     }
     await lookAtTarget(t,.05);
     const hitsBefore=state.hits;
-    const targetHealthBefore=t.health!=null&&Number.isFinite(Number(t.health))?Number(t.health):null;
+    const targetHealthBefore=targetHealthOf(t);
     bot.attack(t);
-    // Respect Java attack-speed recovery instead of issuing sword-speed swings
-    // with slow weapons. A mace smash is handled separately by its fall window.
-    const cooldown=type==="spear"?900:type==="mace"?1667:type==="axe"?1000:625;
-    state.lastAttackAt=Date.now();
-    state.lastAttackAttemptAt=state.lastAttackAt;
-    state.nextAttackAt=state.lastAttackAt+cooldown;
-    state.attackCount++;
-    log("[PVP-EXPERT] swing_issued weapon="+type+" distance="+d.toFixed(2)+" eye_hitbox_distance="+hitboxDistance.toFixed(2)+"; awaiting server damage confirmation");
+    const swing=recordSwing(technique,{distance:d,eyeHitbox:hitboxDistance});
+    log("[PVP-EXPERT] swing_issued weapon="+type+" distance="+d.toFixed(2)+" eye_hitbox_distance="+hitboxDistance.toFixed(2)+
+      " charge="+swing.charge.toFixed(2)+" next_strong_in_ms="+Math.max(0,Math.round(state.nextAttackAt-Date.now()))+
+      "; awaiting server damage confirmation");
     await sprintReset(type);
     await sleep(55);
     const confirmed=await waitForHitConfirmation(t,hitsBefore,targetHealthBefore,280);
+    const healthAfter=targetHealthOf(t);
+    telemetry.outcome(technique,confirmed,{signal:confirmed?"server_damage":"none",
+      damage:targetHealthBefore!=null&&healthAfter!=null?targetHealthBefore-healthAfter:undefined});
     if(!confirmed)log("[PVP-EXPERT] swing_unconfirmed weapon="+type+" target="+state.targetUsername+"; action will enter bounded backoff");
     else await postHitEvasion(t);
     return confirmed;
   };
 
   const fallingCrit=async t=>{
-    if(!await equip("sword")) return false;
-    if(distanceToEntityHitbox(bot.entity,t)>3.05) return false;
+    telemetry.attempted("falling_crit");
+    if(!await equip("sword")){telemetry.rejected("falling_crit","weapon_unavailable");return false}
+    if(distanceToEntityHitbox(bot.entity,t)>reachCap){telemetry.rejected("falling_crit","out_of_reach");return false}
+    // The descent starts ~6 ticks after take-off; the swing must be strong
+    // (charge > 0.9) by then or Player.attack never applies the crit.
+    const chargeWait=attackChargeWaitMs();
+    if(chargeWait>clock.msForTicks(6)){telemetry.rejected("falling_crit","charge_not_ready",{readyInMs:chargeWait});return false}
     bot.setControlState("forward",true);
     bot.setControlState("sprint",true);
     bot.setControlState("jump",true);
@@ -725,39 +810,53 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     const until=Date.now()+700;
     while(state.active&&taskIsActive()&&Date.now()<until){
       peakY=Math.max(peakY,num(bot.entity?.position?.y));
-      if(isAirborne(bot.entity)&&num(bot.entity.velocity?.y)<-.05&&estimateObservedFallDistance(bot.entity,peakY)>=.45) break;
+      if(isAirborne(bot.entity)&&num(bot.entity.velocity?.y)<0&&estimateObservedFallDistance(bot.entity,peakY)>=CRIT_MIN_FALL) break;
       await sleep(20);
     }
     peakY=Math.max(peakY,num(bot.entity?.position?.y));
-    const valid=isAirborne(bot.entity)&&num(bot.entity.velocity?.y)<-.05&&estimateObservedFallDistance(bot.entity,peakY)>=.45&&distanceToEntityHitbox(bot.entity,t)<=3.05;
-    if(!valid){stop();return false}
+    const valid=isAirborne(bot.entity)&&num(bot.entity.velocity?.y)<0&&estimateObservedFallDistance(bot.entity,peakY)>=CRIT_MIN_FALL&&distanceToEntityHitbox(bot.entity,t)<=reachCap;
+    if(!valid){stop();telemetry.rejected("falling_crit",state.active&&taskIsActive()?"no_falling_window":"cancelled");return false}
     // Java critical hits are invalid while sprinting. Release sprint before
     // the falling strike, then re-check the real server-observable window so
     // the jump setup does not become a normal sprint hit by accident.
     bot.setControlState("sprint",false);
     await sleep(30);
-    const critWindowStillValid=isAirborne(bot.entity)&&num(bot.entity.velocity?.y)<-.05&&
-      estimateObservedFallDistance(bot.entity,peakY)>=.45&&distanceToEntityHitbox(bot.entity,t)<=3.05;
-    if(!critWindowStillValid){stop();return false}
+    const critWindowStillValid=isAirborne(bot.entity)&&num(bot.entity.velocity?.y)<0&&
+      estimateObservedFallDistance(bot.entity,peakY)>=CRIT_MIN_FALL&&distanceToEntityHitbox(bot.entity,t)<=reachCap;
+    if(!critWindowStillValid){stop();telemetry.rejected("falling_crit","window_closed");return false}
+    if(!await waitForAttackCharge(clock.msForTicks(2))){stop();telemetry.rejected("falling_crit","charge_not_ready",{charge:currentCharge()});return false}
+    const fall=estimateObservedFallDistance(bot.entity,peakY);
+    const blockers=CM.critBlockers({charge:currentCharge(),fallDistance:fall,onGround:bot.entity?.onGround===true,
+      inWater:bot.entity?.isInWater===true,sprinting:selfSprinting(),targetLiving:true});
+    if(blockers.length){stop();telemetry.rejected("falling_crit",blockers.join("+"),{fall});return false}
     await lookAtTarget(t,.02);
-    const hitsBefore=state.hits,targetHealthBefore=t.health!=null&&Number.isFinite(Number(t.health))?Number(t.health):null;
-    bot.attack(t);state.lastAttackAt=Date.now();state.lastAttackAttemptAt=state.lastAttackAt;state.nextAttackAt=state.lastAttackAt+625;state.attackCount++;
+    const hitsBefore=state.hits,targetHealthBefore=targetHealthOf(t);
+    bot.attack(t);
+    const swing=recordSwing("falling_crit",{fall});
     await sprintReset("sword");stop();
-    return await waitForHitConfirmation(t,hitsBefore,targetHealthBefore,280);
+    const confirmed=await waitForHitConfirmation(t,hitsBefore,targetHealthBefore,280);
+    // A hit is not a crit: only the server's crit animation confirms it.
+    if(critObservedSince(swing.at))telemetry.confirmed("falling_crit",{signal:"entityCriticalEffect",fall});
+    else telemetry.unconfirmed("falling_crit",{hit:confirmed,reason:confirmed?"hit_without_crit_animation":"no_server_damage",fall});
+    return confirmed;
   };
 
   const hitSelect=async t=>{
-    if(!await equip("sword")) return false;
+    telemetry.attempted("hit_select");
+    if(!await equip("sword")){telemetry.rejected("hit_select","weapon_unavailable");return false}
     bot.setControlState("sprint",true);
     bot.setControlState("forward",true);
     await sleep(45);
-    if(distanceToEntityHitbox(bot.entity,t)>3.05){await sprintReset();stop();return false}
+    if(distanceToEntityHitbox(bot.entity,t)>reachCap){await sprintReset();stop();telemetry.rejected("hit_select","out_of_reach");return false}
+    if(!await waitForAttackCharge(120)){telemetry.rejected("hit_select","charge_not_ready",{charge:currentCharge()});return false}
     await lookAtTarget(t,.02);
-    const hitsBefore=state.hits,targetHealthBefore=t.health!=null&&Number.isFinite(Number(t.health))?Number(t.health):null;
-    bot.attack(t);state.lastAttackAt=Date.now();state.lastAttackAttemptAt=state.lastAttackAt;state.nextAttackAt=state.lastAttackAt+625;state.attackCount++;
+    const hitsBefore=state.hits,targetHealthBefore=targetHealthOf(t);
+    bot.attack(t);
+    recordSwing("hit_select");
     await sprintReset();
     bot.setControlState("sprint",false);
     const confirmed=await waitForHitConfirmation(t,hitsBefore,targetHealthBefore,280);
+    telemetry.outcome("hit_select",confirmed,{signal:confirmed?"server_damage":"none"});
     if(!confirmed)log("[PVP-EXPERT] hit_select_unconfirmed target="+state.targetUsername);
     return confirmed;
   };
@@ -814,32 +913,58 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
   };
 
   const shield=async(t,holdMs=260)=>{
-    if(!has(bot,"shield")||Date.now()<state.shieldCooldownUntil)return false;
-    if(!await equip("shield")) return false;
+    telemetry.attempted("shield_block");
+    if(!has(bot,"shield")||Date.now()<state.shieldCooldownUntil){telemetry.rejected("shield_block",has(bot,"shield")?"cooldown":"no_shield");return false}
+    if(!await equip("shield")){telemetry.rejected("shield_block","equip_failed");return false}
+    let blockSignal=null;
+    const onSound=(name,position)=>{
+      if(!/shield[._]block/.test(String(name||"")))return;
+      if(position&&bot.entity?.position&&bot.entity.position.distanceTo(position)>2.5)return;
+      blockSignal=blockSignal||"sound:"+String(name);
+    };
     try{
       if(t) await lookAtTarget(t,.02);
+      try{bot.on?.("soundEffectHeard",onSound)}catch{}
+      const healthAtRaise=num(bot.health,20);
       bot.activateItem();
+      const raisedAt=Date.now();
       // Raising the shield is not the same as blocking the incoming hit.
-      // Keep it raised through the estimated impact window instead of dropping
-      // it immediately after observing the blocking pose.
-      const holdDuration=Math.max(260,Math.min(650,num(holdMs,260)));
-      const deadline=Date.now()+holdDuration;
-      let blockObserved=false;
+      // BlocksAttacks.blockDelaySeconds=0.25: the shield blocks nothing for the
+      // first 5 server ticks of use, so the requested impact window starts
+      // only after that delay.
+      const blockDelayMs=clock.msForTicks(CM.SHIELD_BLOCK_DELAY_TICKS);
+      const effectiveWindowMs=Math.max(260,Math.min(650,num(holdMs,260)));
+      const holdDuration=blockDelayMs+effectiveWindowMs;
+      const effectiveAt=raisedAt+blockDelayMs;
+      const deadline=raisedAt+holdDuration;
+      let blockObserved=false,damagedWhileEffective=false,coveredAtEffective=null;
+      telemetry.executed("shield_block",{blockDelayMs,effectiveWindowMs});
       while(state.active&&taskIsActive()&&Date.now()<deadline){
         if(isEntityBlockingWithShield(bot.entity))blockObserved=true;
+        if(Date.now()>=effectiveAt){
+          if(coveredAtEffective==null&&t?.position&&bot.entity?.position){
+            coveredAtEffective=CM.shieldCoversSource({selfPosition:bot.entity.position,sourcePosition:t.position,
+              headYawDeg:CM.mineflayerYawToMinecraftDeg(bot.entity.yaw)});
+          }
+          if(num(bot.health,20)<healthAtRaise-0.05)damagedWhileEffective=true;
+        }
         await sleep(20);
       }
       bot.deactivateItem();
+      const cancelled=!state.active||!taskIsActive();
       state.shieldCooldownUntil=Date.now()+850;
       await equipBestMelee();
-      log("[PVP-EXPERT] shield_raised_observed="+blockObserved+" projectile_block_confirmed=false melee_weapon_restored=true");
-      return blockObserved;
-    }catch{try{bot.deactivateItem()}catch{};state.shieldCooldownUntil=Date.now()+500;await equipBestMelee();return false}
+      const blockConfirmed=Boolean(blockSignal)&&!damagedWhileEffective;
+      log("[PVP-EXPERT] shield_raised_observed="+blockObserved+" effective_after_ms="+Math.round(blockDelayMs)+
+        " projectile_block_confirmed="+(blockConfirmed?"true":"false")+" melee_weapon_restored=true");
+      if(cancelled)telemetry.rejected("shield_block","cancelled");
+      else telemetry.outcome("shield_block",blockConfirmed,{signal:blockSignal||"none",raised:blockObserved,
+        covered:coveredAtEffective==null?"unknown":coveredAtEffective,damagedWhileEffective});
+      return blockObserved&&!cancelled;
+    }catch{try{bot.deactivateItem()}catch{};state.shieldCooldownUntil=Date.now()+500;await equipBestMelee();telemetry.rejected("shield_block","exception");return false}
+    finally{try{bot.removeListener?.("soundEffectHeard",onSound)}catch{}}
   };
 
-  // Read the crossbow's actual item NBT when available. Mineflayer does not
-  // expose a stable high-level "is loaded" property across supported versions.
-  // Unknown NBT is deliberately treated as unknown, never as loaded.
   const crossbowChargeState=()=>{
     const cross=item(bot,"crossbow")||bot.heldItem;
     const root=cross?.nbt;
@@ -1112,7 +1237,8 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     if(Date.now()<Math.max(state.pearlCooldownUntil,state.pearlFailureUntil))return false;
     const destination=pearlDestination(t,mode);
     if(!destination)return false;
-    if(!await equip("pearl"))return false;
+    telemetry.attempted("pearl_"+mode);
+    if(!await equip("pearl")){telemetry.rejected("pearl_"+mode,"equip_failed");return false}
     const beforePos=bot.entity.position.clone();
     const beforePearls=new Set(Object.values(bot.entities||{}).filter(e=>/ender_pearl/.test(lname(e))).map(e=>e.id));
     let observedPearl=null, pearlSpawnListener=null;
@@ -1124,20 +1250,32 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       };
       bot.on?.("entitySpawn",pearlSpawnListener);
       // A pearl follows a ballistic arc; looking directly at the landing block
-      // points below the needed trajectory and often makes the pearl hit short.
-      // Compensate for gravity using approximate flight ticks (1.35 blocks/tick
-      // horizontal after launch angle/drag) and keep the correction bounded.
+      // hits short. Projectile.shootFromRotation + ThrowableProjectile (1.21.11):
+      // spawn at eyeY-0.1, speed 1.5, per tick gravity 0.03 then drag 0.99,
+      // plus the thrower's own motion (vertical only while airborne). Solve the
+      // launch pitch by simulating that model instead of a drag-free guess.
+      const eyeHeight=num(bot.entity?.eyeHeight,1.62);
+      const pearlSpec=CM.PROJECTILES.ender_pearl;
+      const origin={x:num(beforePos.x),y:num(beforePos.y)+eyeHeight+pearlSpec.spawnEyeOffset,z:num(beforePos.z)};
       const horizontalDistance=Math.hypot(destination.x-beforePos.x,destination.z-beforePos.z);
-      const estimatedFlightTicks=horizontalDistance/1.35;
-      const dropCompensation=Math.max(0.15,Math.min(3.5,0.03*estimatedFlightTicks*(estimatedFlightTicks+1)/2));
-      const aimPoint=destination.offset(0,dropCompensation,0);
+      const solution=CM.solveProjectileAim({origin,target:{x:num(destination.x),y:num(destination.y),z:num(destination.z)},
+        spec:pearlSpec,shooterVelocity:bot.entity?.velocity||null,shooterOnGround:isGroundedEntity(bot.entity)});
+      if(!solution||Math.abs(solution.verticalError)>1.0){
+        log("[PVP-EXPERT] pearl_throw_aim mode="+mode+" horizontal="+horizontalDistance.toFixed(2)+" solvable=false");
+        telemetry.rejected("pearl_"+mode,"trajectory_unsolvable",{horizontal:horizontalDistance});
+        notePearlFailure(mode,"trajectory_unsolvable");
+        return false;
+      }
+      const eyePos=beforePos.offset(0,eyeHeight,0);
+      const aimPoint=eyePos.offset(solution.direction.x*10,solution.direction.y*10,solution.direction.z*10);
       await bot.lookAt(aimPoint,true);
       log("[PVP-EXPERT] pearl_throw_aim mode="+mode+" horizontal="+horizontalDistance.toFixed(2)+
-        " dropCompensation="+dropCompensation.toFixed(2)+" destinationY="+num(destination.y).toFixed(2)+
-        " aimY="+num(aimPoint.y).toFixed(2));
+        " pitch="+solution.pitchDeg.toFixed(2)+" predicted_flight_ticks="+solution.flightTicks.toFixed(1)+
+        " predicted_vertical_error="+solution.verticalError.toFixed(3)+" destinationY="+num(destination.y).toFixed(2));
       bot.activateItem();
       await sleep(85);
       bot.deactivateItem();
+      telemetry.executed("pearl_"+mode,{predictedFlightTicks:solution.flightTicks,horizontal:horizontalDistance});
       let pearl=observedPearl;
       const projectileDeadline=Date.now()+650;
       while(state.active&&taskIsActive()&&Date.now()<projectileDeadline&&!pearl){
@@ -1147,6 +1285,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       }
       if(!pearl){
         log("[PVP-EXPERT] pearl_throw mode="+mode+" projectile_spawned=false teleport_confirmed=false");
+        telemetry.unconfirmed("pearl_"+mode,{reason:"projectile_not_observed"});
         notePearlFailure(mode,"projectile_not_observed");
         return false;
       }
@@ -1161,7 +1300,11 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
         if(isConfirmedPearlTeleport(displacement,stillExists,4)){teleported=true;break}
         await sleep(25);
       }
-      log("[PVP-EXPERT] pearl_throw mode="+mode+" projectile_spawned=true teleport_confirmed="+teleported);
+      const landingError=bot.entity?.position?bot.entity.position.distanceTo(destination):null;
+      log("[PVP-EXPERT] pearl_throw mode="+mode+" projectile_spawned=true teleport_confirmed="+teleported+
+        " landing_error="+(teleported&&landingError!=null?landingError.toFixed(2):"n/a"));
+      telemetry.outcome("pearl_"+mode,teleported,{signal:teleported?"teleport_displacement":"none",
+        landingError:teleported&&landingError!=null?landingError:undefined});
       if(teleported)notePearlSuccess();
       else notePearlFailure(mode,"teleport_unconfirmed");
       return teleported;
@@ -1513,15 +1656,15 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     const before=bot.entity.position.clone();
     const hitsBefore=state.hits;
     const healthBefore=live.health!=null&&Number.isFinite(Number(live.health))?Number(live.health):null;
+    telemetry.attempted("spear_lunge");
+    // Spears carry MINIMUM_ATTACK_CHARGE 1.0: the server ignores an early jab.
+    if(!await waitForAttackCharge(260,1)){telemetry.rejected("spear_lunge","charge_not_full",{charge:currentCharge()});return false}
     try{
       await lookAtTarget(live,.01);
       // Lunge is a spear Jab enchantment: send one real primary attack, not a
       // held secondary-charge sequence. The server owns the actual impulse.
       bot.attack(live);
-      state.lastAttackAt=Date.now();
-      state.lastAttackAttemptAt=state.lastAttackAt;
-      state.nextAttackAt=state.lastAttackAt+900;
-      state.attackCount++;
+      recordSwing("spear_lunge");
       await sleep(80);
       const confirmed=await waitForHitConfirmation(live,hitsBefore,healthBefore,280);
       const impulseDeadline=Date.now()+350;
@@ -1535,6 +1678,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
         " hit_confirmed="+confirmed+
         " enchant_level="+getEnchantmentLevel(spear,"lunge")+
         " observed_displacement="+displacement.toFixed(2));
+      telemetry.outcome("spear_lunge",lungeObserved,{hit:confirmed,displacement});
       return lungeObserved;
     }catch(error){
       log("[PVP-EXPERT] spear_lunge_failed error="+(error?.message||String(error)));
@@ -1859,6 +2003,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
   // equip mace only at the verified falling hit window, then restore sword
   // immediately after the server receives the mace attack.
   const maceAttributeSwap=async t=>{
+    telemetry.attempted("mace_attribute_swap");
     if(!t?.position||!has(bot,"sword")||!has(bot,"mace")||!isAirborne(bot.entity))return false;
     // Last-tick attribute swaps require both weapons on the hotbar; inventory
     // transfers during the fall window are too slow and are rejected safely.
@@ -1874,7 +2019,11 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       const fall=estimateObservedFallDistance(bot.entity,peakY);
       const vy=num(bot.entity?.velocity?.y);
       await lookAtTarget(live,.02);
-      if(vy<-.08&&fall>1.5&&d>=2.35&&d<=3.1){
+      if(vy<-.08&&CM.canMaceSmash({fallDistance:fall,fallFlying:bot.entity?.elytraFlying===true})&&d>=2.35&&d<=3.1){
+        // This technique relies on the setup weapon's charge being applied to
+        // the mace hit; the swap itself resets attackStrengthTicker on the next
+        // server tick (Player.tick). Packet/tick ordering is unverified live.
+        const setupCharge=currentCharge();
         // Last-moment swap: do not carry mace throughout the whole setup.
         if(!selectHotbarItem("mace"))return false;
         const finalD=dist(bot.entity,live);
@@ -1884,13 +2033,13 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
         }
         const hitsBefore=state.hits,targetHealthBefore=live.health!=null&&Number.isFinite(Number(live.health))?Number(live.health):null;
         bot.attack(live);
-        state.lastAttackAt=Date.now();state.lastAttackAttemptAt=state.lastAttackAt;
-        state.nextAttackAt=state.lastAttackAt+1667;state.attackCount++;
-        state.lastMaceSmashAt=Date.now();
+        const swing=recordSwing("mace_attribute_swap",{fall,setupCharge,unverifiedTickOrder:true});
+        state.lastMaceSmashAt=swing.at;
         selectHotbarItem("sword");
         log("[PVP-EXPERT] mace_attribute_swap issued sword_setup=true mace_impact=true sword_restored=true distance="+finalD.toFixed(2)+" fall="+fall.toFixed(2));
         await sprintReset("sword");
         const confirmed=await waitForHitConfirmation(live,hitsBefore,targetHealthBefore,280);
+        telemetry.outcome("mace_attribute_swap",confirmed,{signal:confirmed?"server_damage":"none",critAnimation:critObservedSince(swing.at)});
         log("[PVP-EXPERT] mace_attribute_swap confirmed="+confirmed);
         return confirmed;
       }
@@ -1926,7 +2075,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
     // enough separation to use a wind charge, then wait for the launch and
     // execute a normal server-confirmed falling mace smash. Never send two
     // attack packets in one tick or call the axe hit itself a slam.
-    const axeHit=await attack(t,"axe",3.2);
+    const axeHit=await attack(t,"axe",3.2,{deferOnCharge:false});
     if(!axeHit){
       log("[PVP-EXPERT] stun_slam_confirmed=false phase=axe reason=hit_unconfirmed");
       return false;
@@ -2025,8 +2174,9 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
   };
 
   const maceSmash=async(t,priorFallDistance=0,settleMs=180)=>{
-    if(!t||!has(bot,"mace"))return false;
-    if(!await equip("mace"))return false;
+    telemetry.attempted("mace_smash");
+    if(!t||!has(bot,"mace")){telemetry.rejected("mace_smash","no_mace");return false}
+    if(!await equip("mace")){telemetry.rejected("mace_smash","equip_failed");return false}
     const until=Date.now()+900;
     let peakY=num(bot.entity?.position?.y)+Math.max(0,num(priorFallDistance));
     while(state.active&&taskIsActive()&&Date.now()<until){
@@ -2038,19 +2188,29 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       const fallDistance=estimateObservedFallDistance(bot.entity,peakY);
       await lookAtTarget(live,.02);
       const smashHitboxDistance=distanceToEntityHitbox(bot.entity,live);
-      if(falling&&fallDistance>1.5&&smashHitboxDistance<=3.05){
+      // MaceItem.canSmashAttack: fallDistance > 1.5 and not gliding.
+      const smashReady=CM.canMaceSmash({fallDistance,fallFlying:bot.entity?.elytraFlying===true});
+      if(falling&&smashReady&&smashHitboxDistance<=reachCap){
         stop();
         const hitsBefore=state.hits;
-        const targetHealthBefore=live.health!=null&&Number.isFinite(Number(live.health))?Number(live.health):null;
+        const targetHealthBefore=targetHealthOf(live);
+        const charge=currentCharge();
+        // The smash bonus is added after charge scaling; a strong, non-sprinting
+        // falling hit is also a crit (x1.5 on base damage + smash bonus).
+        const critEligible=CM.canCriticalHit({charge,fallDistance,onGround:false,sprinting:selfSprinting(),inWater:bot.entity?.isInWater===true});
+        const predicted=CM.meleeDamage({attackDamage:6,charge,mace:true,fallDistance,crit:critEligible,
+          densityLevel:getEnchantmentLevel(bot.heldItem,"density")});
         bot.attack(live);
-        state.lastAttackAt=Date.now();
-        state.lastAttackAttemptAt=state.lastAttackAt;
-        state.nextAttackAt=state.lastAttackAt+1667;
-        state.lastMaceSmashAt=Date.now();
-        state.attackCount++;
-        log("[PVP-EXPERT] mace_smash_issued distance="+d.toFixed(2)+" fall="+fallDistance.toFixed(2)+"; awaiting server damage confirmation");
+        const swing=recordSwing("mace_smash",{fall:fallDistance,critEligible,predictedRawDamage:predicted});
+        state.lastMaceSmashAt=swing.at;
+        log("[PVP-EXPERT] mace_smash_issued distance="+d.toFixed(2)+" fall="+fallDistance.toFixed(2)+
+          " charge="+charge.toFixed(2)+" predicted_raw_damage="+predicted.toFixed(1)+"; awaiting server damage confirmation");
         await sleep(settleMs);
         const confirmed=await waitForHitConfirmation(live,hitsBefore,targetHealthBefore,280);
+        const healthAfter=targetHealthOf(live);
+        telemetry.outcome("mace_smash",confirmed,{signal:confirmed?"server_damage":"none",
+          observedDamage:targetHealthBefore!=null&&healthAfter!=null?targetHealthBefore-healthAfter:undefined,
+          critAnimation:critObservedSince(swing.at)});
         log("[PVP-EXPERT] mace_smash_confirmed="+confirmed);
         return confirmed;
       }
@@ -2072,11 +2232,13 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       await sleep(25);
     }
     stop();
+    telemetry.rejected("mace_smash",state.active&&taskIsActive()?"no_smash_window":"cancelled");
     return false;
   };
 
   const wind=async t=>{
-    if(!t||!await equip("wind"))return false;
+    telemetry.attempted("wind_launch");
+    if(!t||!await equip("wind")){telemetry.rejected("wind_launch","no_wind_charge");return false}
     const initialDistance=dist(bot.entity,t);
     if(initialDistance<3.5||initialDistance>6.5)return false;
     try{
@@ -2099,6 +2261,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       }finally{
         if(jumpSynced)bot.setControlState("jump",false);
       }
+      telemetry.executed("wind_launch",{jumpSynced});
       log("[PVP-EXPERT] wind_mace_launch_input jump_synchronized="+jumpSynced+
         " use_issued=true; verifying observed upward impulse");
 
@@ -2116,8 +2279,10 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       }
       if(!launched){
         stop();
+        telemetry.unconfirmed("wind_launch",{reason:"no_upward_impulse_observed"});
         return false;
       }
+      telemetry.confirmed("wind_launch",{signal:"observed_rise",rise:peakY-startY});
 
       state.maceLaunchUntil=Date.now()+2800;
 
@@ -2140,7 +2305,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
           // falling bot and target. Gate the smash on the actual entity hitbox
           // instead, or the controller can pass through a valid hit window
           // without ever issuing the mace strike.
-          if(fallDistance>1.5&&smashHitboxDistance<=3.05){
+          if(CM.canMaceSmash({fallDistance,fallFlying:bot.entity?.elytraFlying===true})&&smashHitboxDistance<=reachCap){
             stop();
             return await maceSmash(live,fallDistance);
           }
@@ -2355,7 +2520,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
         // threshold used by the ordinary mace-smash executor.
         bot.setControlState("forward",d>3.05);
         bot.setControlState("back",d<2.35);
-        if(d<=3.05&&d>=2.35&&vy<-.12&&y>num(live.position?.y)+.3&&fallDistance>1.5){
+        if(d<=3.05&&d>=2.35&&vy<-.12&&y>num(live.position?.y)+.3&&CM.canMaceSmash({fallDistance,fallFlying:bot.entity?.elytraFlying===true})){
           const hitsBefore=state.hits;
           const targetHealthBefore=live.health!=null&&Number.isFinite(Number(live.health))?Number(live.health):null;
           const enemyHeld=lname(live.equipment?.[0]||live.heldItem||"");
@@ -2364,17 +2529,15 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
           // Minecraft has a shared attack-strength cooldown. The brain must
           // schedule shield-break pressure as its own action before this dive.
           bot.attack(live);
-          state.lastAttackAt=Date.now();
-          state.lastAttackAttemptAt=state.lastAttackAt;
-          state.nextAttackAt=state.lastAttackAt+1667;
-          state.lastMaceSmashAt=Date.now();
-          state.attackCount++;
+          const swing=recordSwing("elytra_mace_smash",{fall:fallDistance});
+          state.lastMaceSmashAt=swing.at;
           log("[PVP-EXPERT] elytra_mace_smash_issued distance="+d.toFixed(2)+
             " fall="+fallDistance.toFixed(2)+" enemy_shielding="+enemyShielding+
             "; awaiting server damage confirmation");
           stop();
           await sleep(180);
           const confirmed=await waitForHitConfirmation(live,hitsBefore,targetHealthBefore,280);
+          telemetry.outcome("elytra_mace_smash",confirmed,{signal:confirmed?"server_damage":"none"});
           log("[PVP-EXPERT] elytra_mace_smash_confirmed="+confirmed);
           await restoreElytra();
           return confirmed;
@@ -2401,6 +2564,14 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
   };
 
   const run=async(username,task)=>{
+    const lease=authority.acquire("pvp_expert");
+    if(!lease){
+      const holder=authority.holder("attack")||authority.holder("hotbar")||"unknown";
+      if(task)task.terminationReason="combat_authority_busy:"+holder;
+      log("[PVP-EXPERT] combat_authority_busy holder="+holder+"; refusing to start a competing combat controller");
+      return false;
+    }
+    telemetry.reset();
     state.active=true;state.targetUsername=String(username||"");
     state.lastHealth=num(bot.health,20);state.lastTargetHealth=null;state.nextAttackAt=0;state.lastTargetPos=null;
     state.strafe=1;state.terminationReason=null;state.failedAction=null;state.elytraFlying=false;
@@ -2518,6 +2689,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
           state.lastTargetVelocityAt=motionAt;
         }
 
+        refreshAttackReady();
         const hp=num(bot.health,20),th=num(t.health,20),d=dist(bot.entity,t);
         const selfY=num(bot.entity?.position?.y);
         if(isGroundedEntity(bot.entity)||!Number.isFinite(state.selfPeakY)) state.selfPeakY=selfY;
@@ -2734,7 +2906,7 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
             " target="+state.targetUsername+" targetHP="+(t.health!=null&&Number.isFinite(Number(t.health))?Number(t.health).toFixed(1):"unknown")+
             " targetHeld="+(enemyHeld||"unknown")+" targetTotemEquipped="+enemyTotemNow+" targetTotemPopWindow="+(Date.now()<state.enemyTotemPopUntil)+
             " maceThreat="+enemyMaceThreat+" maceHeldClose="+Boolean(enemyMaceHeld&&d<=7.5)+" distance="+d.toFixed(2)+
-            " attackCooldownMs="+Math.max(0,state.nextAttackAt-Date.now())+" action="+decision.action+
+            " attackCooldownMs="+Math.max(0,Math.round(state.nextAttackAt-Date.now()))+" attackCharge="+currentCharge().toFixed(2)+" serverTps="+clock.tps().toFixed(1)+" action="+decision.action+
             " shieldCount="+count(bot,"shield")+" shieldReady="+Boolean(ctx.shieldReady)+" meleeBlockReady="+Boolean(ctx.meleeBlockReady)+" projectileThreat="+Boolean(ctx.projectileThreat)+" pearlCount="+count(bot,"pearl")+
             " pearlEscapeReady="+Boolean(ctx.pearlEscapeReady&&ctx.recoveryPearlReady)+" pearlCatchReady="+Boolean(ctx.pearlCatchReady)+
             " stunSlamReady="+Boolean(ctx.stunSlamReady)+" pearlAmbushReady="+Boolean(ctx.pearlAmbushReady));
@@ -2878,6 +3050,8 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
       return false;
     }finally{
       state.active=false;stop();
+      try{telemetry.summary()}catch{}
+      lease.release();
       try{bot.removeListener?.("entityElytraFlew",onElytra)}catch{}
       try{bot.removeListener?.("entityHurt",onTargetHurt)}catch{}
       try{bot.removeListener?.("entityStatus",onTargetStatus)}catch{}
@@ -2888,7 +3062,12 @@ export function createPvpExpertController({bot,goals,taskIsActive=()=>true,log=(
   return {
     state,run,
     release:reason=>{state.active=false;state.terminationReason=reason;stop()},
-    brain
+    brain,telemetry,authority,
+    mechanics:{clock,chargeTracker,reachCap,attackSpeedNow,currentCharge},
+    // Deterministic test hooks for the physical executors (no game access).
+    __testing:{attack,fallingCrit,hitSelect,shield,maceSmash,throwPearl,
+      begin(username){state.active=true;state.targetUsername=String(username||"")},
+      end(){state.active=false}}
   };
 }
 export default createPvpExpertController;
